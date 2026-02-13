@@ -16,6 +16,7 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <fstream>
 
 // GStreamer includes
 extern "C" {
@@ -41,31 +42,72 @@ extern "C" {
 class VideoProcessor {
 public:
     VideoProcessor() : modelLoaded(false) {
-        // Попробуем загрузить легковесную модель YOLO
+        // Попробуем загрузить модель YOLO в различных форматах, включая ONNX и конвертацию из PyTorch
         try {
-            // Попробуем найти файлы модели YOLO
-            std::vector<std::string> cfg_paths = {"yolov3-tiny.cfg", "/usr/local/share/opencv4/models/yolov3-tiny.cfg", "./models/yolov3-tiny.cfg"};
-            std::vector<std::string> weights_paths = {"yolov3-tiny.weights", "/usr/local/share/opencv4/models/yolov3-tiny.weights", "./models/yolov3-tiny.weights"};
+            // Попробуем найти файл модели в различных форматах
+            std::vector<std::string> model_paths = {"yolov3-tiny.onnx", "/usr/local/share/opencv4/models/yolov3-tiny.onnx", "./models/yolov3-tiny.onnx", 
+                                                   "yolo.pt", "/usr/local/share/opencv4/models/yolo.pt", "./models/yolo.pt",
+                                                   "yolov3-tiny.weights", "/usr/local/share/opencv4/models/yolov3-tiny.weights", "./models/yolov3-tiny.weights"};
             
-            for(const auto& cfg_path : cfg_paths) {
-                for(const auto& weights_path : weights_paths) {
-                    try {
-                        net = cv::dnn::readNetFromDarknet(cfg_path, weights_path);
-                        if(!net.empty()) {
-                            modelLoaded = true;
-                            std::cout << "YOLO model loaded successfully from " << cfg_path << " and " << weights_path << std::endl;
-                            return;
+            for(const auto& model_path : model_paths) {
+                try {
+                    // First try to load as ONNX model
+                    if(model_path.find(".onnx") != std::string::npos) {
+                        net = cv::dnn::readNetFromONNX(model_path);
+                    } else if(model_path.find(".weights") != std::string::npos) {
+                        // Load Darknet model if it's .weights
+                        std::string cfg_path = model_path;
+                        cfg_path.replace(cfg_path.find(".weights"), 8, ".cfg");
+                        
+                        // Check if corresponding config file exists
+                        if(fileExists(cfg_path)) {
+                            net = cv::dnn::readNetFromDarknet(cfg_path, model_path);
+                        } else {
+                            // Try alternative naming
+                            cfg_path = model_path.substr(0, model_path.find_last_of('/')) + "/" + 
+                                      model_path.substr(model_path.find_last_of('/') + 1, model_path.find_last_of('.') - model_path.find_last_of('/') - 1) + ".cfg";
+                            if(fileExists(cfg_path)) {
+                                net = cv::dnn::readNetFromDarknet(cfg_path, model_path);
+                            } else {
+                                continue;
+                            }
                         }
-                    } catch(...) {
-                        continue; // Пробуем следующую комбинацию
+                    } else if(model_path.find(".pt") != std::string::npos) {
+                        // For PyTorch models, we need to convert to ONNX format first or use alternative approach
+                        // Since OpenCV doesn't directly support .pt models, we'll look for converted ONNX version
+                        std::string onnx_path = model_path.substr(0, model_path.find_last_of('.')) + ".onnx";
+                        if(fileExists(onnx_path)) {
+                            net = cv::dnn::readNetFromONNX(onnx_path);
+                        } else {
+                            // If no ONNX version exists, we could potentially convert here
+                            // For now, just skip .pt files since OpenCV DNN doesn't support them directly
+                            continue;
+                        }
+                    } else {
+                        continue; // Unsupported format
                     }
+                    
+                    if(!net.empty()) {
+                        modelLoaded = true;
+                        std::cout << "YOLO model loaded successfully from " << model_path << std::endl;
+                        return;
+                    }
+                } catch(const std::exception& e) {
+                    std::cout << "Failed to load model from " << model_path << ": " << e.what() << std::endl;
+                    continue; // Пробуем следующий путь
                 }
             }
             
             std::cout << "Warning: Could not load YOLO model, running without detection" << std::endl;
-        } catch (...) {
-            std::cout << "Warning: Could not load YOLO model, running without detection" << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "Warning: Could not load YOLO model, running without detection. Error: " << e.what() << std::endl;
         }
+    }
+    
+    // Helper function to check if file exists
+    bool fileExists(const std::string& filename) {
+        std::ifstream file(filename);
+        return file.good();
     }
 
     void processFrame(cv::Mat& frame) {
