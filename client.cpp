@@ -358,9 +358,14 @@ private:
         
         // Источник видео - UDP
         udpsrc = gst_element_factory_make("udpsrc", "udp_video_source");
+        // Устанавливаем caps для правильного определения типа RTP
+        GstCaps *udpcaps = gst_caps_from_string("application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96");
         g_object_set(GST_OBJECT(udpsrc), 
                      "port", 8600,
+                     "caps", udpcaps,
+                     "buffer-size", 2097152, // Увеличиваем размер буфера
                      NULL);
+        gst_caps_unref(udpcaps);
         
         // Декапсуляция RTP
         rtp_depay = gst_element_factory_make("rtph264depay", "rtp_depayloader");
@@ -370,6 +375,12 @@ private:
         
         // Декодер
         decoder = gst_element_factory_make("avdec_h264", "h264_decoder");
+        // Настройка декодера для лучшей производительности
+        g_object_set(decoder,
+                     "max-threads", 4,
+                     "skip-frame", 0,
+                     "output-corrupt", FALSE,
+                     NULL);
         
         // Конвертер видео
         video_convert = gst_element_factory_make("videoconvert", "video_converter");
@@ -383,6 +394,9 @@ private:
                      "emit-signals", TRUE,
                      "caps", caps,
                      "sync", FALSE,
+                     "max-lateness", -1,
+                     "max-buffers", 5,
+                     "drop", FALSE,
                      NULL);
         g_signal_connect(appsink, "new-sample", G_CALLBACK(new_sample_from_sink), this);
         
