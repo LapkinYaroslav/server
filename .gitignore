@@ -1,1 +1,1 @@
-Nothing needs to be added to .gitignore since only a source code file (client.cpp) was modified and no build artifacts, dependencies, or temporary files were detected in the changes.
+Nothing should be ignored since only a source code file (client.cpp) was modified and no build artifacts, dependencies, or temporary files were present in the changes.
