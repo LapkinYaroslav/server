@@ -9,7 +9,6 @@
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QDateTimeEdit>
-#include <QtNetwork/QTcpSocket>
 #include <QtCore/QTimer>
 #include <QtCore/QDateTime>
 #include <QtCore/QFile>
@@ -17,6 +16,16 @@
 #include <iostream>
 #include <vector>
 #include <string>
+
+// GStreamer includes
+extern "C" {
+#include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
+}
+
+#include <thread>
+#include <mutex>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -122,9 +131,9 @@ class RobotControlClient : public QMainWindow {
 
 public:
     RobotControlClient(QWidget *parent = nullptr) : QMainWindow(parent) {
+        gst_init(NULL, NULL);
         setupUI();
-        connectToServer();
-        setupVideoCapture();
+        initializeGStreamerPipeline();
         
         // Таймер для обновления видео
         videoTimer = new QTimer(this);
@@ -136,33 +145,76 @@ public:
 
 private slots:
     void sendCommand(const QString& cmd) {
-        if (tcpSocket && tcpSocket->state() == QTcpSocket::ConnectedState) {
-            tcpSocket->write(cmd.toUtf8());
-            tcpSocket->flush();
-            
-            // Логирование команды
-            logCommand(cmd);
+        GstMapInfo map_info;
+        gchar buffer[2];
+        buffer[0] = cmd.toStdString()[0];
+        buffer[1] = '\n';
+        
+        GstBuffer *gst_buffer = gst_buffer_new_allocate(NULL, 2, NULL);
+        gst_buffer_map(gst_buffer, &map_info, GST_MAP_WRITE);
+        memcpy(map_info.data, buffer, 2);
+        gst_buffer_unmap(gst_buffer, &map_info);
+        
+        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gst_buffer);
+        if (ret != GST_FLOW_OK) {
+            std::cout << "Failed to push buffer to appsrc" << std::endl;
         }
+        
+        // Логирование команды
+        logCommand(cmd);
+    }
+    
+    static GstFlowReturn new_sample_from_sink(GstElement *sink, gpointer user_data) {
+        RobotControlClient *client = static_cast<RobotControlClient*>(user_data);
+        return client->handleNewSample(sink);
+    }
+    
+    GstFlowReturn handleNewSample(GstElement *sink) {
+        GstSample *sample = NULL;
+        g_object_get(GST_OBJECT(sink), "last-sample", &sample, NULL);
+        
+        if (sample) {
+            GstBuffer *buffer = gst_sample_get_buffer(sample);
+            GstCaps *caps = gst_sample_get_caps(sample);
+            
+            if (buffer && caps) {
+                GstStructure *structure = gst_caps_get_structure(caps, 0);
+                gint width, height;
+                if (gst_structure_get_int(structure, "width", &width) &&
+                    gst_structure_get_int(structure, "height", &height)) {
+                    
+                    GstMapInfo map_info;
+                    if (gst_buffer_map(buffer, &map_info, GST_MAP_READ)) {
+                        // Create OpenCV Mat from GStreamer buffer
+                        frame = cv::Mat(height, width, CV_8UC3, (unsigned char *)map_info.data);
+                        
+                        // Make a copy of the data to ensure it stays valid
+                        frame = frame.clone();
+                        
+                        gst_buffer_unmap(buffer, &map_info);
+                    }
+                }
+            }
+            gst_sample_unref(sample);
+        }
+        return GST_FLOW_OK;
     }
     
     void updateVideoFrame() {
-        if (cap.isOpened()) {
-            cap >> frame;
-            if (!frame.empty()) {
-                // Обработка кадра с помощью YOLO
-                processor->processFrame(frame);
-                
-                // Преобразование OpenCV Mat в QImage
-                QImage qimg;
-                if (frame.channels() == 3) {
-                    cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
-                    qimg = QImage(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_RGB888);
-                } else {
-                    qimg = QImage(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_Grayscale8);
-                }
-                
-                videoLabel->setPixmap(QPixmap::fromImage(qimg.scaled(videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+        if (!frame.empty()) {
+            // Обработка кадра с помощью YOLO
+            processor->processFrame(frame);
+            
+            // Преобразование OpenCV Mat в QImage
+            QImage qimg;
+            if (frame.channels() == 3) {
+                cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
+                qimg = QImage(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_RGB888);
+            } else {
+                qimg = QImage(frame.data, frame.cols, frame.rows, frame.step, QImage::Format_Grayscale8);
             }
+            
+            videoLabel->setPixmap(QPixmap::fromImage(qimg.scaled(videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
         }
     }
 
@@ -241,27 +293,75 @@ private:
         mainLayout->addLayout(buttonLayout);
     }
     
-    void connectToServer() {
-        tcpSocket = new QTcpSocket(this);
-        tcpSocket->connectToHost("192.168.31.251", 8601); // Адрес сервера
+    void initializeGStreamerPipeline() {
+        // Создаем пайплайн для отправки команд и получения видео через GStreamer
+        pipeline = gst_pipeline_new("robot_control_pipeline");
         
-        if (tcpSocket->waitForConnected(5000)) {
-            std::cout << "Connected to robot server" << std::endl;
-        } else {
-            std::cout << "Could not connect to robot server: " << tcpSocket->errorString().toStdString() << std::endl;
+        // AppSrc для отправки команд на сервер
+        appsrc = gst_element_factory_make("appsrc", "command_source");
+        g_object_set(GST_OBJECT(appsrc), "caps", 
+                     gst_caps_new_simple("application/x-gst-control", 
+                                         "format", G_TYPE_STRING, "text",
+                                         NULL),
+                     "stream-type", 0, // STREAM_TYPE_STREAM
+                     "is-live", TRUE,
+                     NULL);
+        
+        // TCP клиент для отправки команд
+        tcp_client = gst_element_factory_make("tcpclientsink", "tcp_client");
+        g_object_set(GST_OBJECT(tcp_client), 
+                     "host", "192.168.31.251",
+                     "port", 8601,
+                     NULL);
+        
+        // Источник видео - UDP
+        udpsrc = gst_element_factory_make("udpsrc", "udp_video_source");
+        g_object_set(GST_OBJECT(udpsrc), 
+                     "port", 8600,
+                     NULL);
+        
+        // Декапсуляция RTP
+        rtp_depay = gst_element_factory_make("rtph264depay", "rtp_depayloader");
+        
+        // Парсер H.264
+        h264_parse = gst_element_factory_make("h264parse", "h264_parser");
+        
+        // Декодер
+        decoder = gst_element_factory_make("avdec_h264", "h264_decoder");
+        
+        // Конвертер видео
+        video_convert = gst_element_factory_make("videoconvert", "video_converter");
+        
+        // AppSink для получения кадров
+        appsink = gst_element_factory_make("appsink", "video_sink");
+        GstCaps *caps = gst_caps_new_simple("video/x-raw",
+                                            "format", G_TYPE_STRING, "RGB",
+                                            NULL);
+        g_object_set(GST_OBJECT(appsink), 
+                     "emit-signals", TRUE,
+                     "caps", caps,
+                     "sync", FALSE,
+                     NULL);
+        g_signal_connect(appsink, "new-sample", G_CALLBACK(new_sample_from_sink), this);
+        
+        // Добавляем элементы в пайплайн
+        gst_bin_add_many(GST_BIN(pipeline), appsrc, tcp_client, udpsrc, rtp_depay, 
+                         h264_parse, decoder, video_convert, appsink, NULL);
+        
+        // Связываем командный путь
+        if (!gst_element_link(appsrc, tcp_client)) {
+            std::cout << "Failed to link command source to TCP client" << std::endl;
         }
-    }
-    
-    void setupVideoCapture() {
-        // Подключение к видеопотоку с Raspberry Pi
-        cap.open("udpsrc port=8600 ! application/x-rtp, encoding-name=H264 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink", cv::CAP_GSTREAMER);
-        if (!cap.isOpened()) {
-            std::cout << "Could not open video stream via GStreamer, trying direct UDP..." << std::endl;
-            // Альтернативный способ открытия потока
-            cap.open("http://192.168.31.251:8080/video_feed"); // Если используется HTTP поток
-            if (!cap.isOpened()) {
-                std::cout << "Could not open video stream" << std::endl;
-            }
+        
+        // Связываем видео путь
+        if (!gst_element_link_many(udpsrc, rtp_depay, h264_parse, decoder, video_convert, appsink, NULL)) {
+            std::cout << "Failed to link video elements" << std::endl;
+        }
+        
+        // Запускаем пайплайн
+        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            std::cout << "Failed to start pipeline" << std::endl;
         }
     }
     
@@ -275,8 +375,7 @@ private:
         }
     }
     
-    QTcpSocket *tcpSocket;
-    cv::VideoCapture cap;
+    GstElement *pipeline, *appsrc, *tcp_client, *udpsrc, *rtp_depay, *h264_parse, *decoder, *video_convert, *appsink;
     cv::Mat frame;
     QLabel *videoLabel;
     QComboBox *commandCombo;
