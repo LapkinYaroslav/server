@@ -23,7 +23,8 @@ static GstElement *msg_appsrc = NULL; // Для ОТПРАВКИ сообщен�
 typedef struct
 {
     GstElement *pipeline;
-    GstElement *msg_pipeline;
+    GstElement *msg_send_pipeline;
+    GstElement *msg_receive_pipeline;
     GMainLoop *main_loop;
 } BusData;
 
@@ -475,12 +476,13 @@ int GStreamerClient::listen()
 
     GMainLoop *main_loop = g_main_loop_new(NULL, FALSE);
 
-    // Инициализация пайплайна для приёма сообщений
-    GstElement *msg_pipeline = init_msg_pipeline(8601);
+    // Инициализация пайплайнов для отправки и приёма сообщений
+    GstElement *msg_send_pipeline = init_msg_send_pipeline(8602);
+    GstElement *msg_receive_pipeline = init_msg_receive_pipeline(8601);
 
     BusData *bus_data = g_new0(BusData, 1); // Используем g_new0 вместо g_new
     bus_data->pipeline = pipeline;
-    bus_data->msg_pipeline = msg_pipeline;
+    bus_data->msg_receive_pipeline = msg_receive_pipeline;
     bus_data->main_loop = main_loop;
 
     /* Запуск пайплайнов */
