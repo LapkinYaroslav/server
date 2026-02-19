@@ -2,50 +2,17 @@
 #include <gst/rtp/gstrtcpbuffer.h>
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <time.h>
-#include <errno.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
-// Конфигурация
 const char *IP_CLIENT = "192.168.31.251";
 int PORT_CLIENT = 8600;
-const char *ARDUINO_PORT = "/dev/ttyACM0"; // Порт для Arduino
-int ARDUINO_BAUD = B9600;                  // Скорость соединения с Arduino
 
-// Состояния робота
-typedef enum
-{
-    ROBOT_STOP = 'X',
-    ROBOT_FORWARD = 'W',
-    ROBOT_BACKWARD = 'S',
-    ROBOT_LEFT = 'A',
-    ROBOT_RIGHT = 'D'
-} robot_command_t;
-
-// Глобальные переменные
 static GstElement *global_pipeline = NULL;
 static GstElement *msg_appsrc = NULL;
-static int arduino_fd = -1; // Файл дескриптор для Arduino
-static volatile robot_command_t current_command = ROBOT_STOP;
-static volatile int connection_active = 1; // Активна ли связь
-static volatile int emergency_stop = 0;    // Аварийная остановка
-static pthread_mutex_t command_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t serial_reader_thread;
-static volatile int keep_reading = 1;
 
-// Структуры данных
 typedef struct
 {
     GstElement *pipeline;
@@ -61,250 +28,6 @@ typedef struct
     GMainLoop *main_loop;
     guint timeout_id;
 } FileWatcherData;
-
-// Структура для отслеживания состояния RTCP
-typedef struct
-{
-    guint32 last_packet_count;
-    time_t last_packet_time;
-    int connected;
-} RTCPMonitor;
-
-// Функция для логирования команд
-void log_command(robot_command_t cmd, const char *source)
-{
-    FILE *log_file = fopen("commands.log", "a");
-    if (log_file)
-    {
-        time_t now = time(0);
-        char *time_str = ctime(&now);
-        time_str[strlen(time_str) - 1] = '\0'; // Убираем символ новой строки
-
-        fprintf(log_file, "[%s] %s: ", time_str, source);
-
-        switch (cmd)
-        {
-        case ROBOT_FORWARD:
-            fprintf(log_file, "FORWARD\n");
-            break;
-        case ROBOT_BACKWARD:
-            fprintf(log_file, "BACKWARD\n");
-            break;
-        case ROBOT_LEFT:
-            fprintf(log_file, "LEFT\n");
-            break;
-        case ROBOT_RIGHT:
-            fprintf(log_file, "RIGHT\n");
-            break;
-        case ROBOT_STOP:
-            fprintf(log_file, "STOP\n");
-            break;
-        default:
-            fprintf(log_file, "UNKNOWN(%c)\n", cmd);
-            break;
-        }
-
-        fclose(log_file);
-    }
-}
-
-// Функция для логирования расстояния
-void log_distance(float distance)
-{
-    FILE *log_file = fopen("distance.log", "a");
-    if (log_file)
-    {
-        time_t now = time(0);
-        char *time_str = ctime(&now);
-        time_str[strlen(time_str) - 1] = '\0'; // Убираем символ новой строки
-
-        fprintf(log_file, "[%s] DISTANCE: %.2f cm\n", time_str, distance);
-        fclose(log_file);
-    }
-}
-
-// Функция для отправки команды на Arduino
-int send_command_to_arduino(robot_command_t cmd)
-{
-    if (arduino_fd == -1)
-    {
-        g_printerr("Ошибка: соединение с Arduino не установлено\n");
-        return -1;
-    }
-
-    char command_char = (char)cmd;
-    ssize_t bytes_written = write(arduino_fd, &command_char, 1);
-
-    if (bytes_written < 0)
-    {
-        g_printerr("Ошибка при отправке команды на Arduino: %s\n", strerror(errno));
-        return -1;
-    }
-
-    g_print("Команда '%c' отправлена на Arduino\n", command_char);
-    log_command(cmd, "SERVER");
-
-    return 0;
-}
-
-// Функция для открытия соединения с Arduino
-int connect_to_arduino()
-{
-    arduino_fd = open(ARDUINO_PORT, O_RDWR | O_NOCTTY);
-    if (arduino_fd == -1)
-    {
-        g_printerr("Не удалось открыть порт %s: %s\n", ARDUINO_PORT, strerror(errno));
-        return -1;
-    }
-
-    struct termios tty;
-    if (tcgetattr(arduino_fd, &tty) != 0)
-    {
-        g_printerr("Ошибка получения параметров терминала: %s\n", strerror(errno));
-        close(arduino_fd);
-        return -1;
-    }
-
-    cfmakeraw(&tty);
-    cfsetspeed(&tty, ARDUINO_BAUD);
-
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~PARENB; // Без проверки четности
-    tty.c_cflag &= ~CSTOPB; // Один стоп-бит
-    tty.c_cflag &= ~CSIZE;  // Очищаем размер данных
-    tty.c_cflag |= CS8;     // 8 бит данных
-
-    tty.c_cc[VMIN] = 0;  // Неблокирующий режим
-    tty.c_cc[VTIME] = 1; // Тайм-аут в децисекундах
-
-    if (tcsetattr(arduino_fd, TCSANOW, &tty) != 0)
-    {
-        g_printerr("Ошибка установки параметров терминала: %s\n", strerror(errno));
-        close(arduino_fd);
-        return -1;
-    }
-
-    tcflush(arduino_fd, TCIOFLUSH);
-
-    g_print("Подключение к Arduino успешно установлено на %s\n", ARDUINO_PORT);
-    return 0;
-}
-
-// Поток для чтения данных с Arduino (расстояние)
-void *read_serial_data(void *arg)
-{
-    char buffer[256];
-    char leftover[256] = {0};
-    int leftover_len = 0;
-
-    while (keep_reading)
-    {
-        if (arduino_fd == -1)
-        {
-            usleep(100000); // Подождать 100мс если соединение не установлено
-            continue;
-        }
-
-        ssize_t n = read(arduino_fd, buffer, sizeof(buffer) - 1 - leftover_len);
-        if (n > 0)
-        {
-            buffer[n] = '\0';
-
-            // Объединяем остаток с новыми данными
-            char combined[256];
-            strcpy(combined, leftover);
-            strncat(combined, buffer, n);
-
-            // Ищем метки DIST и END
-            char *start = combined;
-            while ((start = strstr(start, "DIST:")) != NULL)
-            {
-                char *end = strstr(start, ":END");
-                if (end != NULL)
-                {
-                    *end = '\0';                // Заменяем :END на конец строки
-                    char *dist_str = start + 5; // Пропускаем "DIST:"
-
-                    // Парсим значение расстояния
-                    char *endptr;
-                    float distance = strtof(dist_str, &endptr);
-
-                    if (*endptr == '\0' || *endptr == '\r' || *endptr == '\n')
-                    {
-                        g_print("Получено расстояние: %.2f см\n", distance);
-                        log_distance(distance);
-
-                        // Проверяем, нужно ли остановить робота из-за препятствия
-                        if (distance < 20.0)
-                        { // Порог 20 см
-                            pthread_mutex_lock(&command_mutex);
-                            if (current_command != ROBOT_STOP)
-                            {
-                                g_print("Обнаружено препятствие! Расстояние: %.2f см. Робот остановлен.\n", distance);
-                                emergency_stop = 1;
-                                robot_command_t prev_cmd = current_command;
-                                current_command = ROBOT_STOP;
-
-                                // Отправляем команду остановки на Arduino
-                                send_command_to_arduino(ROBOT_STOP);
-                            }
-                            pthread_mutex_unlock(&command_mutex);
-                        }
-                        else if (emergency_stop)
-                        {
-                            // Если были в состоянии аварийной остановки и теперь безопасно
-                            pthread_mutex_lock(&command_mutex);
-                            emergency_stop = 0;
-                            g_print("Препятствие устранено. Робот готов к движению.\n");
-                            pthread_mutex_unlock(&command_mutex);
-                        }
-                    }
-
-                    // Сдвигаем указатель для следующего поиска
-                    start = end + 4; // Пропускаем ":END"
-                }
-                else
-                {
-                    // Сохраняем оставшиеся неполные данные
-                    int remaining_len = strlen(start);
-                    if (remaining_len < sizeof(leftover))
-                    {
-                        strcpy(leftover, start);
-                        leftover_len = remaining_len;
-                    }
-                    else
-                    {
-                        leftover_len = 0; // Если слишком длинно, сбрасываем
-                    }
-                    break; // Выходим, так как нет полных данных
-                }
-            }
-
-            // Сохраняем оставшиеся неполные данные в конце строки
-            if (start != NULL && *start != '\0')
-            {
-                int remaining_len = strlen(start);
-                if (remaining_len < sizeof(leftover))
-                {
-                    strcpy(leftover, start);
-                    leftover_len = remaining_len;
-                }
-                else
-                {
-                    leftover_len = 0; // Если слишком длинно, сбрасываем
-                }
-            }
-            else
-            {
-                leftover_len = 0; // Очищаем, если все данные обработаны
-            }
-        }
-
-        usleep(50000); // Ждем 50мс
-    }
-
-    return NULL;
-}
 
 static void adapt_quality(GstElement *encoder, guint8 fraction_lost, guint32 jitter)
 {
@@ -360,7 +83,7 @@ static void sigint_handler(int sig)
     }
 }
 
-// Callback для обработки полученных RTCP пакетов
+// Callback
 static void on_rtcp_received(GstElement *rtpbin, GstBuffer *buffer, guint session, gpointer user_data)
 {
     GstElement *encoder = GST_ELEMENT(user_data);
@@ -390,60 +113,11 @@ static void on_rtcp_received(GstElement *rtpbin, GstBuffer *buffer, guint sessio
                     NULL,
                     &delay);
 
-                // Обновляем состояние подключения
-                connection_active = 1;
-
                 adapt_quality(encoder, fraction_lost, jitter);
             }
         } while (gst_rtcp_packet_move_to_next(&packet));
         gst_rtcp_buffer_unmap(&rtcpbuf);
     }
-}
-
-// Функция для обработки потери связи
-void handle_connection_lost()
-{
-    g_print("Обнаружена потеря связи! Выполняется сдача назад...\n");
-
-    // Отправляем команду на сдачу назад
-    pthread_mutex_lock(&command_mutex);
-    robot_command_t original_command = current_command;
-    current_command = ROBOT_BACKWARD;
-    pthread_mutex_unlock(&command_mutex);
-
-    send_command_to_arduino(ROBOT_BACKWARD);
-
-    // Ждем немного, затем возвращаем предыдущую команду
-    sleep(2);
-
-    pthread_mutex_lock(&command_mutex);
-    current_command = original_command;
-    if (original_command != ROBOT_STOP)
-    {
-        send_command_to_arduino(original_command);
-    }
-    else
-    {
-        send_command_to_arduino(ROBOT_STOP);
-    }
-    pthread_mutex_unlock(&command_mutex);
-}
-
-// Таймер для проверки состояния RTCP
-gboolean check_rtcp_status(gpointer user_data)
-{
-    static time_t last_check = 0;
-    time_t current_time = time(NULL);
-
-    // Если прошло больше 2 секунд без получения RTCP пакетов
-    if (current_time - last_check > 2 && connection_active)
-    {
-        connection_active = 0;
-        handle_connection_lost();
-    }
-
-    last_check = current_time;
-    return G_SOURCE_CONTINUE; // Продолжаем вызывать этот таймер
 }
 
 static gboolean bus_msg_handler(GstBus *bus, GstMessage *msg, gpointer user_data)
@@ -517,53 +191,15 @@ GstElement *init_msg_pipeline(int port)
     return pipeline;
 }
 
-// Обработка команд от клиента
-void process_client_command(char command)
+void handle_connection_lost()
 {
-    robot_command_t cmd;
+    g_print("It's over!");
+}
 
-    switch (command)
-    {
-    case 'W':
-    case 'w':
-        cmd = ROBOT_FORWARD;
-        break;
-    case 'S':
-    case 's':
-        cmd = ROBOT_BACKWARD;
-        break;
-    case 'A':
-    case 'a':
-        cmd = ROBOT_LEFT;
-        break;
-    case 'D':
-    case 'd':
-        cmd = ROBOT_RIGHT;
-        break;
-    case 'X':
-    case 'x':
-        cmd = ROBOT_STOP;
-        break;
-    default:
-        g_print("Получена неизвестная команда: %c\n", command);
-        return;
-    }
-
-    pthread_mutex_lock(&command_mutex);
-    // Проверяем, является ли команда движением и есть ли аварийная остановка
-    if (emergency_stop && cmd != ROBOT_STOP)
-    {
-        g_print("Команда '%c' отклонена из-за обнаруженного препятствия\n", command);
-        pthread_mutex_unlock(&command_mutex);
-        return;
-    }
-
-    // Обновляем текущую команду
-    current_command = cmd;
-    pthread_mutex_unlock(&command_mutex);
-
-    // Отправляем команду на Arduino
-    send_command_to_arduino(cmd);
+static void on_rtp_timeout(GstElement *rtpbin, guint session, gpointer user_data)
+{
+    g_print("RTCP timeout detected - connection lost!\n");
+    handle_connection_lost();
 }
 
 static gboolean check_and_read_file(gpointer user_data)
@@ -615,13 +251,6 @@ static gboolean check_and_read_file(gpointer user_data)
             if (strlen(buffer) > 0)
             {
                 g_print("Отправляю новую строку: %s\n", buffer);
-
-                // Обрабатываем команды из файла
-                for (int i = 0; i < strlen(buffer); i++)
-                {
-                    process_client_command(buffer[i]);
-                }
-
                 send_message(buffer);
             }
         }
@@ -703,24 +332,6 @@ int tutorial_main(int argc, char *argv[])
 
     /* Initialize GStreamer */
     gst_init(&argc, &argv);
-
-    // Подключаемся к Arduino
-    if (connect_to_arduino() != 0)
-    {
-        g_printerr("Не удалось подключиться к Arduino, продолжаем работу без Arduino\n");
-    }
-    else
-    {
-        // Запускаем поток для чтения данных с Arduino
-        if (pthread_create(&serial_reader_thread, NULL, read_serial_data, NULL) != 0)
-        {
-            g_printerr("Не удалось создать поток для чтения данных с Arduino\n");
-        }
-        else
-        {
-            g_print("Поток чтения данных с Arduino запущен\n");
-        }
-    }
 
     /* Create the elements */
 #ifdef _WIN32
@@ -897,10 +508,6 @@ int tutorial_main(int argc, char *argv[])
     gst_object_unref(tee_src_pad2);
     gst_object_unref(queue_sink_pad);
 
-    // Подключаем callback для получения RTCP пакетов
-    g_signal_connect(rtpbin, "on-ssrc-active", G_CALLBACK(on_rtcp_received), x264enc_stream);
-    g_signal_connect(rtpbin, "on-telephone-event", G_CALLBACK(on_rtcp_received), x264enc_stream);
-
     global_pipeline = pipeline;
     signal(SIGINT, sigint_handler);
 
@@ -912,6 +519,8 @@ int tutorial_main(int argc, char *argv[])
     bus_data->pipeline = pipeline;
     bus_data->msg_pipeline = msg_pipeline;
     bus_data->main_loop = main_loop;
+
+    // g_signal_connect(rtpbin, "on-timeout", G_CALLBACK(on_rtp_timeout), NULL);
 
     /* Start playing */
     ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -941,9 +550,6 @@ int tutorial_main(int argc, char *argv[])
     gst_bus_add_watch(bus, bus_msg_handler, bus_data);
     gst_bus_add_watch(msg_bus, bus_msg_handler, bus_data);
 
-    // Запускаем таймер для проверки состояния RTCP
-    g_timeout_add(1000, check_rtcp_status, NULL);
-
     // add func to gst main loop
     start_file_monitor("messages.txt", main_loop);
 
@@ -951,21 +557,6 @@ int tutorial_main(int argc, char *argv[])
     g_main_loop_run(main_loop);
 
     /* Free resources */
-    keep_reading = 0; // Останавливаем поток чтения данных с Arduino
-
-    // Ждем завершения потока чтения данных
-    if (&serial_reader_thread)
-    {
-        pthread_join(serial_reader_thread, NULL);
-    }
-
-    // Закрываем соединение с Arduino
-    if (arduino_fd != -1)
-    {
-        close(arduino_fd);
-        arduino_fd = -1;
-    }
-
     gst_object_unref(bus);
     gst_object_unref(msg_bus);
     gst_element_set_state(pipeline, GST_STATE_NULL);
