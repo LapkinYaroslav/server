@@ -1,5 +1,6 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include <gst/rtp/gstrtcpbuffer.h>
 #include <QImage>
 #include <iostream>
 #include <cstdio>
@@ -36,8 +37,22 @@ typedef struct
     guint timeout_id;
 } FileWatcherData;
 
-// ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
-void send_message(const gchar *message)
+static void adapt_quality(guint8 fraction_lost, guint32 jitter)
+{
+    // Логика адаптации качества
+    g_print("Получено состояние канала: потери=%d%%, джиттер=%u\\n", fraction_lost, jitter);
+    
+    if (fraction_lost > 10 || jitter > 50000)
+    {
+        // Плохое качество - уменьшаем битрейт
+        g_print("Обнаружены проблемы с качеством связи\\n");
+    }
+    else if (fraction_lost < 2 && jitter < 10000)
+    {
+        // Хорошее качество - можно повысить
+        g_print("Качество связи хорошее\\n");
+    }
+}
 {
     if (!msg_appsrc)
     {
