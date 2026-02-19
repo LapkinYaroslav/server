@@ -1,7 +1,0 @@
-build
-out
-vcpkg
-CMakeLists-msvc.txt
-CMakePresets-1.json
-CMakePresets.json
-.vscode
